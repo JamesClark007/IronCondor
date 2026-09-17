@@ -1,0 +1,65 @@
+name: 0dte-report
+
+# Daily performance snapshot, ~20 minutes after the close.
+# 20:20 UTC = 16:20 ET in EDT; 21:20 UTC = 16:20 ET in EST.
+# Running twice a day is harmless — the snapshot is keyed by date and
+# overwrites the same row rather than duplicating it.
+on:
+  schedule:
+    - cron: '20 20 * * 1-5'
+    - cron: '20 21 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build report
+        env:
+          TRADIER_TOKEN: ${{ secrets.TRADIER_TOKEN }}
+          TRADIER_ACCOUNT_ID: ${{ secrets.TRADIER_ACCOUNT_ID }}
+        run: |
+          set -o pipefail
+          python report.py --days 90 --snapshot 2>&1 | tee report_output.txt
+
+      - name: Publish report to run summary
+        if: always()
+        run: |
+          echo "### Performance report" >> "$GITHUB_STEP_SUMMARY"
+          echo '```text' >> "$GITHUB_STEP_SUMMARY"
+          cat report_output.txt >> "$GITHUB_STEP_SUMMARY" || echo "(no output captured)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit equity curve
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- equity_curve.csv 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "No equity change to commit."
+            exit 0
+          fi
+          git commit -m "report: daily equity snapshot [skip ci]"
+          for i in 1 2 3 4 5; do
+            if git pull --rebase --autostash && git push; then
+              exit 0
+            fi
+            sleep $(( (RANDOM % 5) + 3 ))
+          done
+          echo "::error::Could not push equity_curve.csv after 5 attempts."
+          exit 1

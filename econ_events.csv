@@ -1,0 +1,8 @@
+date,event
+# Add one row per event day you want to sit out, e.g.:
+# 2026-09-18,FOMC
+# 2026-10-02,NFP
+# 2026-10-13,CPI
+# 2026-10-30,PCE
+# Half days and early closes belong here too — manage.py's 15:45 flatten
+# never runs on a 13:00 close.

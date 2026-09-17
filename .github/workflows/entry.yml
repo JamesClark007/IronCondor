@@ -1,0 +1,72 @@
+name: 0dte-entry
+
+# entry.py gates itself on America/New_York time (09:35-09:45), so it is safe
+# to schedule both the EDT and EST slots — the wrong one just prints
+# "Outside entry window" and exits without touching the API.
+#
+# 13:xx UTC = 09:xx ET during EDT (Mar-Nov)
+# 14:xx UTC = 09:xx ET during EST (Nov-Mar)
+#
+# Several attempts are scheduled inside the window because GitHub's scheduler
+# is best-effort and routinely runs late.
+on:
+  schedule:
+    - cron: '30,33,36,39,42 13 * * 1-5'
+    - cron: '30,33,36,39,42 14 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  entry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run entry
+        env:
+          TRADIER_TOKEN: ${{ secrets.TRADIER_TOKEN }}
+          TRADIER_ACCOUNT_ID: ${{ secrets.TRADIER_ACCOUNT_ID }}
+        run: |
+          set -o pipefail
+          python entry.py 2>&1 | tee entry_output.txt
+
+      - name: Publish log to run summary
+        if: always()
+        run: |
+          echo "### entry.py output" >> "$GITHUB_STEP_SUMMARY"
+          echo '```text' >> "$GITHUB_STEP_SUMMARY"
+          cat entry_output.txt >> "$GITHUB_STEP_SUMMARY" || echo "(no output captured)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit state back to the repo
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- state.json econ_events.csv 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "No state change to commit."
+            exit 0
+          fi
+          git commit -m "state: after entry run [skip ci]"
+          for i in 1 2 3 4 5; do
+            if git pull --rebase --autostash && git push; then
+              echo "State pushed."
+              exit 0
+            fi
+            echo "Push attempt $i failed, retrying..."
+            sleep $(( (RANDOM % 5) + 3 ))
+          done
+          echo "::error::Could not push state.json after 5 attempts."
+          exit 1

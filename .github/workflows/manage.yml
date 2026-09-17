@@ -1,0 +1,72 @@
+name: 0dte-manage
+
+# Every 5 minutes across both the EDT and EST versions of the US session.
+# 13:00-21:00 UTC covers 09:00-17:00 ET in EDT and 08:00-16:00 ET in EST.
+#
+# manage.py returns immediately (zero API calls) whenever state.json says the
+# bot is flat, so the extra runs outside the real session cost nothing but a
+# few seconds of runner time.
+#
+# NOTE on cost: this is roughly 100 billable runner-minutes per trading day.
+# Public repos get unlimited free Actions minutes; private repos do not.
+# See RUNBOOK.md, "Cost and the free-minutes ceiling".
+on:
+  schedule:
+    - cron: '*/5 13-21 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  manage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run manage
+        env:
+          TRADIER_TOKEN: ${{ secrets.TRADIER_TOKEN }}
+          TRADIER_ACCOUNT_ID: ${{ secrets.TRADIER_ACCOUNT_ID }}
+        run: |
+          set -o pipefail
+          python manage.py 2>&1 | tee manage_output.txt
+
+      - name: Publish log to run summary
+        if: always()
+        run: |
+          echo "### manage.py output" >> "$GITHUB_STEP_SUMMARY"
+          echo '```text' >> "$GITHUB_STEP_SUMMARY"
+          cat manage_output.txt >> "$GITHUB_STEP_SUMMARY" || echo "(no output captured)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit state back to the repo
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- state.json 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "No state change to commit."
+            exit 0
+          fi
+          git commit -m "state: after manage run [skip ci]"
+          for i in 1 2 3 4 5; do
+            if git pull --rebase --autostash && git push; then
+              echo "State pushed."
+              exit 0
+            fi
+            echo "Push attempt $i failed, retrying..."
+            sleep $(( (RANDOM % 5) + 3 ))
+          done
+          echo "::error::Could not push state.json after 5 attempts."
+          exit 1
