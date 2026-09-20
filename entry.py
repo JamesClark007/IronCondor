@@ -12,8 +12,16 @@ Runs the full filter gate (variance risk premium, VIX trend, short-vol
 stagnation, news day) via filters.py before ever building an order — see
 that module's docstring for the Tradier-symbol caveats around the VIX
 family of indices.
+
+Every run appends exactly one row to decision_log.csv (keyed by date, so a
+re-run the same day overwrites that day's row rather than duplicating it),
+recording whether the bot entered, previewed, or skipped, and why. Check
+that file (or the "Entry decision" section of the GitHub Actions run
+summary) instead of digging through logs to answer "did it trade today?".
 """
 import sys
+import os
+import csv
 from datetime import datetime, date
 import pytz
 
@@ -39,6 +47,31 @@ CONFIG = {
     "vix1d_stagnant_max_intraday_range_pct": 15.0,
     "news_events_file": "econ_events.csv",
 }
+
+DECISION_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "decision_log.csv")
+
+
+def log_decision(decision, reason):
+    """Append/overwrite today's row in decision_log.csv: date, decision, reason.
+
+    Keyed by date so re-running entry.py the same day (e.g. manual
+    workflow_dispatch after a real scheduled run) updates that day's row
+    instead of creating duplicates — same pattern report.py uses for
+    equity_curve.csv.
+    """
+    today = date.today().isoformat()
+    rows = {}
+    if os.path.exists(DECISION_LOG_PATH):
+        with open(DECISION_LOG_PATH, newline="") as f:
+            for row in csv.DictReader(f):
+                rows[row["date"]] = row
+    rows[today] = {"date": today, "decision": decision, "reason": reason}
+    with open(DECISION_LOG_PATH, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["date", "decision", "reason"])
+        w.writeheader()
+        for day in sorted(rows):
+            w.writerow(rows[day])
+    print(f"\nDECISION: {decision} — {reason}")
 
 
 def in_entry_window():
@@ -69,6 +102,7 @@ def main():
     ok, now = in_entry_window()
     if not ok:
         print(f"Outside entry window (current ET time: {now.strftime('%H:%M:%S')}) — exiting without action.")
+        log_decision("SKIPPED", "outside entry window (09:35-09:45 ET)")
         return
 
     # --- Filter gate: all must pass or we don't enter ---
@@ -131,6 +165,7 @@ def main():
         print("FILTERS FAILED — not entering today:")
         for f in filter_failures:
             print(f"  - {f}")
+        log_decision("SKIPPED", "; ".join(filter_failures))
         return
 
     print("All filters passed — proceeding to strike selection.")
@@ -138,11 +173,13 @@ def main():
     state = new_day_reset_if_needed(load_state())
     if state["status"] != "flat":
         print(f"State is '{state['status']}' — already acted today. Exiting.")
+        log_decision("SKIPPED", f"already acted today (state={state['status']})")
         return
 
     quote = client.get_quote(CONFIG["underlying"])
     if not quote or "last" not in quote:
         print("Could not get a quote — exiting.")
+        log_decision("SKIPPED", "no quote available for underlying")
         return
     spot = quote["last"]
 
@@ -151,11 +188,13 @@ def main():
     exp = today_str if today_str in expirations else (expirations[0] if expirations else None)
     if not exp:
         print("No expirations available — exiting.")
+        log_decision("SKIPPED", "no option expirations available")
         return
 
     chain = client.get_chain(CONFIG["underlying"], exp)
     if not chain:
         print("Empty options chain — exiting.")
+        log_decision("SKIPPED", "empty options chain")
         return
 
     atm_call = nearest(chain, spot, "call")
@@ -186,6 +225,7 @@ def main():
 
     if net_credit <= 0:
         print("Net credit is zero or negative — bad data or no real edge. Exiting without placing an order.")
+        log_decision("SKIPPED", f"net credit non-positive ({net_credit})")
         return
 
     if CONFIG["dry_run"]:
@@ -194,6 +234,10 @@ def main():
         )
         print("PREVIEW result (no order placed):", result)
         print("dry_run=True — set CONFIG['dry_run']=False to actually submit paper orders.")
+        log_decision(
+            "PREVIEWED (dry-run)",
+            f"would enter — credit={net_credit}, short_call={short_call['symbol']}, short_put={short_put['symbol']}",
+        )
         return
 
     result = client.place_multileg_order(
@@ -217,6 +261,10 @@ def main():
         },
     })
     save_state(state)
+    log_decision(
+        "ENTERED",
+        f"credit={net_credit}, short_call={short_call['symbol']}, short_put={short_put['symbol']}, order_id={order_id}",
+    )
 
 
 if __name__ == "__main__":
